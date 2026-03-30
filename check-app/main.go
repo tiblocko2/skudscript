@@ -1,9 +1,8 @@
-// Приложение для отметки сотрудников СКУД
+// Приложение для отметки сотрудников СКУД с графическим интерфейсом
 // Считывает карту через считыватель и создает Excel отчеты
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,46 +12,44 @@ import (
 
 	"skudscript/db"
 
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
 	"github.com/xuri/excelize/v2"
 )
 
-// readCardID считывает ID карты с клавиатуры (считывателя)
-// Ожидает ввод и нажатие Enter
-func readCardID(reader *bufio.Reader) (string, error) {
-	fmt.Println("\n📌 Приложите карту к считывателю...")
-	fmt.Print("> ")
+// CheckApp представляет приложение для отметки сотрудников
+type CheckApp struct {
+	app         fyne.App
+	window      fyne.Window
+	database    *db.DB
+	cardEntry   *widget.Entry
+	statusLabel *widget.Label
+	infoLabel   *widget.Label
+}
 
-	cardID, err := reader.ReadString('\n')
+// getExePath возвращает путь к текущему исполняемому файлу
+func getExePath() string {
+	exePath, err := os.Executable()
 	if err != nil {
-		return "", fmt.Errorf("ошибка чтения карты: %w", err)
+		exePath, _ = os.Getwd()
 	}
-
-	// Удаляем символы новой строки и пробелы
-	cardID = strings.TrimSpace(cardID)
-
-	if cardID == "" {
-		return "", fmt.Errorf("карта не считана")
-	}
-
-	return cardID, nil
+	return exePath
 }
 
 // getReportDir возвращает путь к папке для хранения отчетов
-// Папка Otchet создается в той же директории, что и exe файл
 func getReportDir(exePath string) string {
 	return filepath.Join(filepath.Dir(exePath), "Otchet")
-}
-
-// getReportFilename возвращает имя файла отчета для указанной даты
-// Формат: YYYY-MM-DD.xlsx
-func getReportFilename(date time.Time) string {
-	return date.Format("2006-01-02") + ".xlsx"
 }
 
 // getReportPath возвращает полный путь к файлу отчета
 func getReportPath(exePath string, date time.Time) string {
 	reportDir := getReportDir(exePath)
-	return filepath.Join(reportDir, getReportFilename(date))
+	return filepath.Join(reportDir, date.Format("2006-01-02")+".xlsx")
 }
 
 // ensureReportDir создает папку для отчетов, если она не существует
@@ -62,9 +59,7 @@ func ensureReportDir(exePath string) error {
 }
 
 // createNewReport создает новый Excel файл отчета для указанной даты
-// Добавляет заголовки столбцов: Время, ФИО, Карточка
 func createNewReport(exePath string, date time.Time) error {
-	// Создаем папку для отчетов, если она не существует
 	err := ensureReportDir(exePath)
 	if err != nil {
 		return fmt.Errorf("ошибка создания папки отчетов: %w", err)
@@ -72,26 +67,21 @@ func createNewReport(exePath string, date time.Time) error {
 
 	reportPath := getReportPath(exePath, date)
 
-	// Создаем новый Excel файл
 	f := excelize.NewFile()
 	defer f.Close()
 
-	// Получаем имя листа по умолчанию
 	sheetName := f.GetSheetName(0)
 
-	// Устанавливаем заголовки столбцов
 	headers := []string{"Время", "ФИО", "Карточка"}
 	for i, header := range headers {
 		cell, _ := excelize.CoordinatesToCellName(i+1, 1)
 		f.SetCellValue(sheetName, cell, header)
 	}
 
-	// Настраиваем ширину столбцов
-	f.SetColWidth(sheetName, "A", "A", 15) // Время
-	f.SetColWidth(sheetName, "B", "B", 30) // ФИО
-	f.SetColWidth(sheetName, "C", "C", 20) // Карточка
+	f.SetColWidth(sheetName, "A", "A", 15)
+	f.SetColWidth(sheetName, "B", "B", 30)
+	f.SetColWidth(sheetName, "C", "C", 20)
 
-	// Делаем заголовки жирными
 	style, _ := f.NewStyle(&excelize.Style{
 		Font: &excelize.Font{Bold: true},
 		Alignment: &excelize.Alignment{
@@ -104,7 +94,6 @@ func createNewReport(exePath string, date time.Time) error {
 		f.SetCellStyle(sheetName, cell, cell, style)
 	}
 
-	// Сохраняем файл
 	if err := f.SaveAs(reportPath); err != nil {
 		return fmt.Errorf("ошибка сохранения отчета: %w", err)
 	}
@@ -120,11 +109,9 @@ func checkReportExists(exePath string, date time.Time) bool {
 }
 
 // addRecordToReport добавляет запись в Excel отчет
-// Создает новый отчет, если он еще не существует
 func addRecordToReport(exePath string, date time.Time, cardID, fullName string) error {
 	reportPath := getReportPath(exePath, date)
 
-	// Если отчет не существует, создаем новый
 	if !checkReportExists(exePath, date) {
 		err := createNewReport(exePath, date)
 		if err != nil {
@@ -132,18 +119,14 @@ func addRecordToReport(exePath string, date time.Time, cardID, fullName string) 
 		}
 	}
 
-	// Открываем существующий файл
 	f, err := excelize.OpenFile(reportPath)
 	if err != nil {
 		return fmt.Errorf("ошибка открытия отчета: %w", err)
 	}
 	defer f.Close()
 
-	// Получаем имя листа
 	sheetName := f.GetSheetName(0)
 
-	// Находим последнюю заполненную строку
-	// Получаем все строки листа для определения последней заполненной
 	rows, err := f.GetRows(sheetName)
 	if err != nil {
 		return fmt.Errorf("ошибка чтения строк: %w", err)
@@ -151,15 +134,12 @@ func addRecordToReport(exePath string, date time.Time, cardID, fullName string) 
 	lastRow := len(rows)
 	nextRow := lastRow + 1
 
-	// Форматируем текущее время
 	currentTime := time.Now().Format("15:04:05")
 
-	// Добавляем новую строку с данными
 	f.SetCellValue(sheetName, fmt.Sprintf("A%d", nextRow), currentTime)
 	f.SetCellValue(sheetName, fmt.Sprintf("B%d", nextRow), fullName)
 	f.SetCellValue(sheetName, fmt.Sprintf("C%d", nextRow), cardID)
 
-	// Сохраняем файл
 	if err := f.SaveAs(reportPath); err != nil {
 		return fmt.Errorf("ошибка сохранения отчета: %w", err)
 	}
@@ -167,59 +147,46 @@ func addRecordToReport(exePath string, date time.Time, cardID, fullName string) 
 	return nil
 }
 
-// getExePath возвращает путь к текущему исполняемому файлу
-func getExePath() string {
-	exePath, err := os.Executable()
-	if err != nil {
-		// Если не удалось получить путь к exe, используем текущую директорию
-		exePath, _ = os.Getwd()
+// showStatus отображает сообщение о статусе операции
+func (a *CheckApp) showStatus(message string, isError bool) {
+	a.statusLabel.SetText(message)
+	if isError {
+		a.statusLabel.TextStyle = fyne.TextStyle{Bold: true}
 	}
-	return exePath
+	a.statusLabel.Refresh()
 }
 
-func main() {
-	// Настройка консоли для корректного отображения UTF-8 на Windows
-	cmd := exec.Command("chcp", "65001")
-	cmd.Run()
+// clearStatus очищает сообщение о статусе
+func (a *CheckApp) clearStatus() {
+	a.statusLabel.SetText("")
+}
 
-	fmt.Println("\n🚀 Система отметки сотрудников СКУД")
-	fmt.Println(strings.Repeat("=", 50))
+// resetUI сбрасывает интерфейс в исходное состояние
+func (a *CheckApp) resetUI() {
+	a.cardEntry.SetText("")
+	a.clearStatus()
+	a.infoLabel.SetText("")
+	a.window.Canvas().Focus(a.cardEntry)
+}
 
-	// Инициализация базы данных
-	database, err := db.InitDB(getExePath())
-	if err != nil {
-		fmt.Printf("❌ Ошибка инициализации базы данных: %v\n", err)
-		fmt.Println("\nНажмите Enter для выхода...")
-		bufio.NewReader(os.Stdin).ReadString('\n')
-		return
-	}
-	defer database.Close()
+// processCard обрабатывает карту сотрудника
+func (a *CheckApp) processCard() {
+	cardID := strings.TrimSpace(a.cardEntry.Text)
 
-	reader := bufio.NewReader(os.Stdin)
-
-	// Считывание карты
-	cardID, err := readCardID(reader)
-	if err != nil {
-		fmt.Printf("❌ Ошибка считывания карты: %v\n", err)
-		fmt.Println("\nНажмите Enter для выхода...")
-		reader.ReadString('\n')
+	if cardID == "" {
+		a.showStatus("❌ Карта не считана", true)
 		return
 	}
 
 	// Поиск сотрудника по карте
-	user, err := database.GetUserByCardID(cardID)
+	user, err := a.database.GetUserByCardID(cardID)
 	if err != nil {
-		fmt.Printf("❌ Ошибка поиска сотрудника: %v\n", err)
-		fmt.Println("\nНажмите Enter для выхода...")
-		reader.ReadString('\n')
+		a.showStatus(fmt.Sprintf("❌ Ошибка поиска: %v", err), true)
 		return
 	}
 
 	if user == nil {
-		fmt.Println("\n❌ Сотрудник с такой картой не найден!")
-		fmt.Println("   Обратитесь к администратору для регистрации карты.")
-		fmt.Println("\nНажмите Enter для выхода...")
-		reader.ReadString('\n')
+		a.showStatus("❌ Сотрудник с такой картой не найден!\nОбратитесь к администратору", true)
 		return
 	}
 
@@ -229,20 +196,120 @@ func main() {
 	// Добавляем запись в отчет
 	err = addRecordToReport(getExePath(), currentDate, user.CardID, user.FullName)
 	if err != nil {
-		fmt.Printf("❌ Ошибка записи в отчет: %v\n", err)
-		fmt.Println("\nНажмите Enter для выхода...")
-		reader.ReadString('\n')
+		a.showStatus(fmt.Sprintf("❌ Ошибка записи в отчет: %v", err), true)
 		return
 	}
 
 	// Успешная отметка
-	fmt.Println("\n" + strings.Repeat("=", 50))
-	fmt.Println("✅ Отметка успешна!")
-	fmt.Printf("   Сотрудник: %s\n", user.FullName)
-	fmt.Printf("   Время: %s\n", time.Now().Format("15:04:05"))
-	fmt.Printf("   Дата: %s\n", currentDate.Format("02.01.2006"))
-	fmt.Println(strings.Repeat("=", 50))
+	currentTime := time.Now().Format("15:04:05")
+	currentDateStr := currentDate.Format("02.01.2006")
 
-	fmt.Println("\nНажмите Enter для выхода...")
-	reader.ReadString('\n')
+	a.showStatus("✅ Отметка успешна!", false)
+	a.infoLabel.SetText(fmt.Sprintf("Сотрудник: %s\nВремя: %s\nДата: %s",
+		user.FullName, currentTime, currentDateStr))
+
+	// Автоматический сброс через 3 секунды
+	go func() {
+		time.Sleep(3 * time.Second)
+		a.window.Canvas().Focus(nil)
+		a.window.Canvas().Focus(a.cardEntry)
+		a.resetUI()
+	}()
+}
+
+// createUI создает пользовательский интерфейс
+func (a *CheckApp) createUI() {
+	a.cardEntry = widget.NewEntry()
+	a.cardEntry.SetPlaceHolder("Приложите карту к считывателю...")
+	a.cardEntry.OnSubmitted = func(s string) {
+		a.processCard()
+	}
+
+	a.statusLabel = widget.NewLabel("")
+	a.statusLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+	a.infoLabel = widget.NewLabel("")
+	a.infoLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+	// Иконка карты
+	cardIcon := widget.NewIcon(theme.AccountIcon())
+
+	// Инструкция
+	instruction := widget.NewLabel("Приложите карту к считывателю")
+	instruction.TextStyle = fyne.TextStyle{Bold: true}
+	instruction.Alignment = fyne.TextAlignCenter
+
+	// Поле ввода карты (скрытое, для считывателя)
+	cardForm := widget.NewForm(
+		widget.NewFormItem("ID карты", a.cardEntry),
+	)
+
+	// Кнопка ручной обработки
+	manualBtn := widget.NewButtonWithIcon("Обработать", theme.ConfirmIcon(), func() {
+		a.processCard()
+	})
+	manualBtn.Importance = widget.HighImportance
+
+	// Кнопка выхода
+	exitBtn := widget.NewButtonWithIcon("Выход", theme.CancelIcon(), func() {
+		a.app.Quit()
+	})
+
+	content := container.NewVBox(
+		layout.NewSpacer(),
+		cardIcon,
+		instruction,
+		widget.NewSeparator(),
+		container.NewPadded(cardForm),
+		container.NewHBox(layout.NewSpacer(), manualBtn, layout.NewSpacer()),
+		a.statusLabel,
+		a.infoLabel,
+		layout.NewSpacer(),
+		container.NewHBox(exitBtn),
+	)
+
+	a.window.SetContent(container.NewPadded(content))
+}
+
+// run запускает приложение
+func (a *CheckApp) run() {
+	a.createUI()
+	a.window.ShowAndRun()
+}
+
+// newCheckApp создает новое приложение для отметки сотрудников
+func newCheckApp(database *db.DB) *CheckApp {
+	appInstance := app.New()
+	window := appInstance.NewWindow("СКУД - Отметка сотрудников")
+	window.Resize(fyne.NewSize(500, 400))
+
+	checkApp := &CheckApp{
+		app:      appInstance,
+		window:   window,
+		database: database,
+	}
+
+	// Обработка закрытия окна
+	window.SetOnClosed(func() {
+		checkApp.app.Quit()
+	})
+
+	return checkApp
+}
+
+func main() {
+	// Настройка консоли для корректного отображения UTF-8 на Windows
+	cmd := exec.Command("chcp", "65001")
+	cmd.Run()
+
+	// Инициализация базы данных
+	database, err := db.InitDB(getExePath())
+	if err != nil {
+		dialog.ShowError(fmt.Errorf("ошибка инициализации базы данных: %v", err), nil)
+		return
+	}
+	defer database.Close()
+
+	checkApp := newCheckApp(database)
+	checkApp.run()
 }
