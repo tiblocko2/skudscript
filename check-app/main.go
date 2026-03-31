@@ -1,5 +1,6 @@
 // Приложение для отметки сотрудников СКУД с графическим интерфейсом
 // Считывает карту через считыватель и создает Excel отчеты
+// Работает в фоновом режиме, автоматически обрабатывает карты от считывателя
 package main
 
 import (
@@ -8,7 +9,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
 
 	"skudscript/db"
 
@@ -22,6 +25,57 @@ import (
 	"github.com/xuri/excelize/v2"
 )
 
+// CardReader обрабатывает ввод карты с проверкой скорости и формата
+type CardReader struct {
+	mu            sync.Mutex
+	keyTimes      []time.Time
+	lastClearTime time.Time
+}
+
+// NewCardReader создает новый обработчик карт
+func NewCardReader() *CardReader {
+	return &CardReader{
+		keyTimes: make([]time.Time, 0, 10),
+	}
+}
+
+// AddKey регистрирует нажатие клавиши и возвращает true если карта готова
+func (cr *CardReader) AddKey() bool {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+
+	now := time.Now()
+
+	// Если прошло больше 100 мс с последнего символа - сбрасываем
+	if len(cr.keyTimes) > 0 && now.Sub(cr.keyTimes[len(cr.keyTimes)-1]) > 100*time.Millisecond {
+		cr.keyTimes = cr.keyTimes[:0]
+	}
+
+	cr.keyTimes = append(cr.keyTimes, now)
+
+	// Если введено 10 символов быстро - карта готова
+	if len(cr.keyTimes) == 10 {
+		// Проверяем, что все символы введены быстро (< 100 мс между каждым)
+		for i := 1; i < len(cr.keyTimes); i++ {
+			if cr.keyTimes[i].Sub(cr.keyTimes[i-1]) > 100*time.Millisecond {
+				cr.keyTimes = cr.keyTimes[:0]
+				return false
+			}
+		}
+		cr.keyTimes = cr.keyTimes[:0]
+		return true
+	}
+
+	return false
+}
+
+// Clear очищает буфер
+func (cr *CardReader) Clear() {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	cr.keyTimes = cr.keyTimes[:0]
+}
+
 // CheckApp представляет приложение для отметки сотрудников
 type CheckApp struct {
 	app         fyne.App
@@ -30,6 +84,7 @@ type CheckApp struct {
 	cardEntry   *widget.Entry
 	statusLabel *widget.Label
 	infoLabel   *widget.Label
+	cardReader  *CardReader
 }
 
 // getExePath возвращает путь к текущему исполняемому файлу
@@ -164,17 +219,30 @@ func (a *CheckApp) clearStatus() {
 // resetUI сбрасывает интерфейс в исходное состояние
 func (a *CheckApp) resetUI() {
 	a.cardEntry.SetText("")
+	a.cardReader.Clear()
 	a.clearStatus()
 	a.infoLabel.SetText("")
 	a.window.Canvas().Focus(a.cardEntry)
 }
 
-// processCard обрабатывает карту сотрудника
-func (a *CheckApp) processCard() {
-	cardID := strings.TrimSpace(a.cardEntry.Text)
+// isValidCardID проверяет, что строка содержит ровно 10 цифр
+func isValidCardID(s string) bool {
+	if len(s) != 10 {
+		return false
+	}
+	for _, r := range s {
+		if !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
+}
 
-	if cardID == "" {
-		a.showStatus("❌ Карта не считана", true)
+// processCard обрабатывает карту сотрудника
+func (a *CheckApp) processCard(cardID string) {
+	if !isValidCardID(cardID) {
+		a.showStatus("❌ Неверный формат карты (должно быть 10 цифр)", true)
+		a.cardReader.Clear()
 		return
 	}
 
@@ -187,6 +255,7 @@ func (a *CheckApp) processCard() {
 
 	if user == nil {
 		a.showStatus("❌ Сотрудник с такой картой не найден!\nОбратитесь к администратору", true)
+		a.cardReader.Clear()
 		return
 	}
 
@@ -208,6 +277,8 @@ func (a *CheckApp) processCard() {
 	a.infoLabel.SetText(fmt.Sprintf("Сотрудник: %s\nВремя: %s\nДата: %s",
 		user.FullName, currentTime, currentDateStr))
 
+	a.cardReader.Clear()
+
 	// Автоматический сброс через 3 секунды
 	go func() {
 		time.Sleep(3 * time.Second)
@@ -217,13 +288,59 @@ func (a *CheckApp) processCard() {
 	}()
 }
 
+// setupInputHandler настраивает обработчик ввода для считывателя карт
+func (a *CheckApp) setupInputHandler() {
+	prevText := ""
+
+	// Используем OnChanged для отслеживания изменений в поле ввода
+	a.cardEntry.OnChanged = func(text string) {
+		// Если текст стал короче - это backspace, игнорируем
+		if len(text) < len(prevText) {
+			a.cardReader.Clear()
+			prevText = text
+			return
+		}
+
+		// Если добавился один символ
+		if len(text) == len(prevText)+1 {
+			// Регистрируем нажатие клавиши
+			if a.cardReader.AddKey() {
+				// 10 символов введены быстро - обрабатываем карту
+				if isValidCardID(text) {
+					a.processCard(text)
+				} else {
+					// Нецифровые символы - очищаем
+					a.cardEntry.SetText("")
+					a.cardReader.Clear()
+				}
+				prevText = ""
+				return
+			}
+		}
+
+		// Если текст изменился значительно - проверяем на валидность
+		if len(text) >= 10 {
+			if isValidCardID(text) {
+				a.processCard(text)
+				prevText = ""
+				return
+			} else {
+				// Есть нецифровые символы - очищаем
+				a.cardEntry.SetText("")
+				a.cardReader.Clear()
+				prevText = ""
+				return
+			}
+		}
+
+		prevText = text
+	}
+}
+
 // createUI создает пользовательский интерфейс
 func (a *CheckApp) createUI() {
 	a.cardEntry = widget.NewEntry()
 	a.cardEntry.SetPlaceHolder("Приложите карту к считывателю...")
-	a.cardEntry.OnSubmitted = func(s string) {
-		a.processCard()
-	}
 
 	a.statusLabel = widget.NewLabel("")
 	a.statusLabel.TextStyle = fyne.TextStyle{Bold: true}
@@ -239,14 +356,19 @@ func (a *CheckApp) createUI() {
 	instruction.TextStyle = fyne.TextStyle{Bold: true}
 	instruction.Alignment = fyne.TextAlignCenter
 
-	// Поле ввода карты (скрытое, для считывателя)
+	// Статус работы считывателя
+	readerStatus := widget.NewLabel("🟢 Считыватель активен (10 цифр)")
+	readerStatus.TextStyle = fyne.TextStyle{Italic: true}
+
+	// Поле ввода карты
 	cardForm := widget.NewForm(
 		widget.NewFormItem("ID карты", a.cardEntry),
 	)
 
 	// Кнопка ручной обработки
 	manualBtn := widget.NewButtonWithIcon("Обработать", theme.ConfirmIcon(), func() {
-		a.processCard()
+		cardID := strings.TrimSpace(a.cardEntry.Text)
+		a.processCard(cardID)
 	})
 	manualBtn.Importance = widget.HighImportance
 
@@ -259,6 +381,7 @@ func (a *CheckApp) createUI() {
 		layout.NewSpacer(),
 		cardIcon,
 		instruction,
+		readerStatus,
 		widget.NewSeparator(),
 		container.NewPadded(cardForm),
 		container.NewHBox(layout.NewSpacer(), manualBtn, layout.NewSpacer()),
@@ -274,6 +397,7 @@ func (a *CheckApp) createUI() {
 // run запускает приложение
 func (a *CheckApp) run() {
 	a.createUI()
+	a.setupInputHandler()
 	a.window.ShowAndRun()
 }
 
@@ -281,12 +405,13 @@ func (a *CheckApp) run() {
 func newCheckApp(database *db.DB) *CheckApp {
 	appInstance := app.New()
 	window := appInstance.NewWindow("СКУД - Отметка сотрудников")
-	window.Resize(fyne.NewSize(500, 400))
+	window.Resize(fyne.NewSize(500, 450))
 
 	checkApp := &CheckApp{
-		app:      appInstance,
-		window:   window,
-		database: database,
+		app:        appInstance,
+		window:     window,
+		database:   database,
+		cardReader: NewCardReader(),
 	}
 
 	// Обработка закрытия окна
