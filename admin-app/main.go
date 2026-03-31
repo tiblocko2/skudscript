@@ -309,19 +309,25 @@ func (a *AdminApp) createUI() {
 
 	mainMenu := a.createMainMenu()
 
-	// Заголовок списка
 	listLabel := widget.NewLabel("Список сотрудников:")
 	listLabel.TextStyle = fyne.TextStyle{Bold: true}
 
-	content := container.NewVBox(
+	content := container.NewBorder(
 		listLabel,
+		nil,
+		nil,
+		nil,
 		a.userList,
 	)
 
-	a.content = container.NewScroll(content)
-	a.content.SetMinSize(fyne.NewSize(0, 400))
+	mainContent := container.NewBorder(
+		mainMenu,
+		a.statusLabel,
+		nil,
+		nil,
+		content,
+	)
 
-	mainContent := container.NewBorder(mainMenu, a.statusLabel, nil, nil, a.content)
 	a.window.SetContent(mainContent)
 }
 
