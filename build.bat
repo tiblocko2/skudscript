@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 echo ============================================
-echo Сборка приложений СКУД в EXE файлы
+echo Сборка приложений СКУД в EXE файлы (GUI)
 echo ============================================
 echo.
 
@@ -28,7 +28,7 @@ echo [1/2] Сборка admin-app.exe...
 set CGO_ENABLED=1
 set GOOS=windows
 set GOARCH=amd64
-go build -o dist\admin-app.exe -ldflags="-s -w" admin-app\main.go
+go build -o dist\admin-app.exe -ldflags="-s -w -H windowsgui" admin-app\main.go
 if %ERRORLEVEL% neq 0 (
     echo [ОШИБКА] Не удалось собрать admin-app.exe
     pause
@@ -39,7 +39,7 @@ echo.
 
 REM Сборка приложения отметки
 echo [2/2] Сборка check-app.exe...
-go build -o dist\check-app.exe -ldflags="-s -w" check-app\main.go
+go build -o dist\check-app.exe -ldflags="-s -w -H windowsgui" check-app\main.go
 if %ERRORLEVEL% neq 0 (
     echo [ОШИБКА] Не удалось собрать check-app.exe
     pause
@@ -53,12 +53,9 @@ echo Сборка завершена успешно!
 echo ============================================
 echo.
 echo Готовые файлы находятся в папке: dist\
-echo   - admin-app.exe  (админ-панель)
-echo   - check-app.exe  (отметка сотрудников)
+echo   - admin-app.exe  (админ-панель с GUI)
+echo   - check-app.exe  (отметка сотрудников с GUI)
 echo.
-echo Для создания архива ZIP:
-echo   1. Скопируйте папку dist в нужное место
-echo   2. Добавьте файл README.txt с инструкцией
-echo   3. Запакуйте в ZIP архив
+echo Для создания архива ZIP запустите: create-archive.bat
 echo.
 pause
