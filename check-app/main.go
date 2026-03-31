@@ -1,90 +1,226 @@
-// Приложение для отметки сотрудников СКУД с графическим интерфейсом
-// Считывает карту через считыватель и создает Excel отчеты
-// Работает в фоновом режиме, автоматически обрабатывает карты от считывателя
+// Приложение для отметки сотрудников СКУД
+// Работает в системном трее, перехватывает ввод карт на глобальном уровне
 package main
 
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
+	"unsafe"
 
 	"skudscript/db"
 
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/app"
-	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/theme"
-	"fyne.io/fyne/v2/widget"
+	"fyne.io/systray"
 	"github.com/xuri/excelize/v2"
+	"golang.org/x/sys/windows"
 )
 
-// CardReader обрабатывает ввод карты с проверкой скорости и формата
-type CardReader struct {
-	mu            sync.Mutex
-	keyTimes      []time.Time
-	lastClearTime time.Time
+// === Windows API константы ===
+
+const (
+	WH_KEYBOARD_LL = 13
+	WM_KEYDOWN     = 0x0100
+	WM_SYSKEYDOWN  = 0x0104
+	VK_BACK        = 0x08
+	VK_RETURN      = 0x0D
+	VK_ESCAPE      = 0x1B
+	VK_0           = 0x30
+	VK_9           = 0x39
+)
+
+var (
+	user32   = syscall.NewLazyDLL("user32.dll")
+	kernel32 = syscall.NewLazyDLL("kernel32.dll")
+
+	procSetWindowsHookEx    = user32.NewProc("SetWindowsHookExW")
+	procUnhookWindowsHookEx = user32.NewProc("UnhookWindowsHookEx")
+	procCallNextHookEx      = user32.NewProc("CallNextHookEx")
+	procGetModuleHandle     = kernel32.NewProc("GetModuleHandleW")
+	procMessageBox          = user32.NewProc("MessageBoxW")
+)
+
+// KBDLLHOOKSTRUCT структура для перехвата клавиш
+type KBDLLHOOKSTRUCT struct {
+	VkCode      uint32
+	ScanCode    uint32
+	Flags       uint32
+	Time        uint32
+	DwExtraInfo uintptr
 }
 
-// NewCardReader создает новый обработчик карт
-func NewCardReader() *CardReader {
-	return &CardReader{
-		keyTimes: make([]time.Time, 0, 10),
-	}
-}
+type HHOOK windows.Handle
 
-// AddKey регистрирует нажатие клавиши и возвращает true если карта готова
-func (cr *CardReader) AddKey() bool {
-	cr.mu.Lock()
-	defer cr.mu.Unlock()
+// === Глобальные переменные ===
 
-	now := time.Now()
-
-	// Если прошло больше 100 мс с последнего символа - сбрасываем
-	if len(cr.keyTimes) > 0 && now.Sub(cr.keyTimes[len(cr.keyTimes)-1]) > 100*time.Millisecond {
-		cr.keyTimes = cr.keyTimes[:0]
-	}
-
-	cr.keyTimes = append(cr.keyTimes, now)
-
-	// Если введено 10 символов быстро - карта готова
-	if len(cr.keyTimes) == 10 {
-		// Проверяем, что все символы введены быстро (< 100 мс между каждым)
-		for i := 1; i < len(cr.keyTimes); i++ {
-			if cr.keyTimes[i].Sub(cr.keyTimes[i-1]) > 100*time.Millisecond {
-				cr.keyTimes = cr.keyTimes[:0]
-				return false
-			}
-		}
-		cr.keyTimes = cr.keyTimes[:0]
-		return true
-	}
-
-	return false
-}
-
-// Clear очищает буфер
-func (cr *CardReader) Clear() {
-	cr.mu.Lock()
-	defer cr.mu.Unlock()
-	cr.keyTimes = cr.keyTimes[:0]
-}
-
-// CheckApp представляет приложение для отметки сотрудников
-type CheckApp struct {
-	app         fyne.App
-	window      fyne.Window
+var (
+	hook        HHOOK
+	cardBuffer  strings.Builder
+	keyTimes    []time.Time
+	bufferMu    sync.Mutex
+	lastKeyTime time.Time
 	database    *db.DB
-	cardEntry   *widget.Entry
-	statusLabel *widget.Label
-	infoLabel   *widget.Label
-	cardReader  *CardReader
+)
+
+// isValidCardID проверяет, что строка содержит ровно 10 цифр
+func isValidCardID(s string) bool {
+	if len(s) != 10 {
+		return false
+	}
+	for _, r := range s {
+		if !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// utf16FromString преобразует строку в UTF-16 для Windows API
+func utf16FromString(s string) *uint16 {
+	ret, _ := syscall.UTF16PtrFromString(s)
+	return ret
+}
+
+// showNotification показывает уведомление через Windows MessageBox
+func showNotification(title, message string) {
+	// Используем MessageBox для уведомлений
+	procMessageBox.Call(
+		0,
+		uintptr(unsafe.Pointer(utf16FromString(message))),
+		uintptr(unsafe.Pointer(utf16FromString(title))),
+		0x40, // MB_ICONINFORMATION
+	)
+}
+
+// processCardID обрабатывает ID карты
+func processCardID(cardID string) {
+	if !isValidCardID(cardID) {
+		return
+	}
+
+	// Поиск сотрудника по карте
+	user, err := database.GetUserByCardID(cardID)
+	if err != nil {
+		showNotification("Ошибка СКУД", fmt.Sprintf("Ошибка поиска: %v", err))
+		return
+	}
+
+	if user == nil {
+		showNotification("Карта не найдена", "Сотрудник с такой картой не зарегистрирован")
+		return
+	}
+
+	// Добавляем запись в отчет
+	currentDate := time.Now()
+	err = addRecordToReport(getExePath(), currentDate, user.CardID, user.FullName)
+	if err != nil {
+		showNotification("Ошибка отчета", fmt.Sprintf("Ошибка: %v", err))
+		return
+	}
+
+	// Успешная отметка
+	currentTime := time.Now().Format("15:04:05")
+	currentDateStr := currentDate.Format("02.01.2006")
+	showNotification(
+		"✅ Отметка успешна!",
+		fmt.Sprintf("%s\n%s %s", user.FullName, currentDateStr, currentTime),
+	)
+}
+
+// keyboardHook процедура перехвата клавиш
+func keyboardHook(nCode int, wParam uintptr, lParam uintptr) uintptr {
+	if nCode >= 0 && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+		kbdStruct := (*KBDLLHOOKSTRUCT)(unsafe.Pointer(lParam))
+
+		// Проверяем специальные клавиши
+		if kbdStruct.VkCode == VK_BACK || kbdStruct.VkCode == VK_ESCAPE {
+			bufferMu.Lock()
+			cardBuffer.Reset()
+			keyTimes = keyTimes[:0]
+			bufferMu.Unlock()
+			return callNextHook(nCode, wParam, lParam)
+		}
+
+		// Проверяем Enter - обработка карты
+		if kbdStruct.VkCode == VK_RETURN {
+			bufferMu.Lock()
+			cardID := cardBuffer.String()
+			if cardID != "" {
+				go processCardID(cardID)
+			}
+			cardBuffer.Reset()
+			keyTimes = keyTimes[:0]
+			bufferMu.Unlock()
+			return callNextHook(nCode, wParam, lParam)
+		}
+
+		// Обработка цифр (0-9)
+		now := time.Now()
+		bufferMu.Lock()
+
+		// Если прошло больше 100 мс с последнего символа - сбрасываем буфер
+		if !lastKeyTime.IsZero() && now.Sub(lastKeyTime) > 100*time.Millisecond {
+			cardBuffer.Reset()
+			keyTimes = keyTimes[:0]
+		}
+
+		lastKeyTime = now
+
+		// Проверяем, что введена цифра (VK 0-9 = 48-57)
+		if kbdStruct.VkCode >= VK_0 && kbdStruct.VkCode <= VK_9 {
+			cardBuffer.WriteByte(byte('0' + (kbdStruct.VkCode - VK_0)))
+			keyTimes = append(keyTimes, now)
+		} else {
+			// Нецифровой символ - сбрасываем
+			cardBuffer.Reset()
+			keyTimes = keyTimes[:0]
+		}
+
+		bufferMu.Unlock()
+	}
+
+	return callNextHook(nCode, wParam, lParam)
+}
+
+func callNextHook(nCode int, wParam, lParam uintptr) uintptr {
+	ret, _, _ := procCallNextHookEx.Call(
+		uintptr(hook),
+		uintptr(nCode),
+		wParam,
+		lParam,
+	)
+	return ret
+}
+
+// setHook устанавливает глобальный хук клавиатуры
+func setHook() error {
+	hModule, _, _ := procGetModuleHandle.Call(0)
+
+	h, _, err := procSetWindowsHookEx.Call(
+		WH_KEYBOARD_LL,
+		syscall.NewCallback(keyboardHook),
+		hModule,
+		0, // 0 = глобальный хук
+	)
+
+	if h == 0 {
+		return fmt.Errorf("ошибка установки хука: %v", err)
+	}
+
+	hook = HHOOK(h)
+	return nil
+}
+
+// unhook удаляет хук
+func unhook() {
+	if hook != 0 {
+		procUnhookWindowsHookEx.Call(uintptr(hook))
+		hook = 0
+	}
 }
 
 // getExePath возвращает путь к текущему исполняемому файлу
@@ -107,13 +243,13 @@ func getReportPath(exePath string, date time.Time) string {
 	return filepath.Join(reportDir, date.Format("2006-01-02")+".xlsx")
 }
 
-// ensureReportDir создает папку для отчетов, если она не существует
+// ensureReportDir создает папку для отчетов
 func ensureReportDir(exePath string) error {
 	reportDir := getReportDir(exePath)
 	return os.MkdirAll(reportDir, 0755)
 }
 
-// createNewReport создает новый Excel файл отчета для указанной даты
+// createNewReport создает новый Excel файл отчета
 func createNewReport(exePath string, date time.Time) error {
 	err := ensureReportDir(exePath)
 	if err != nil {
@@ -156,7 +292,7 @@ func createNewReport(exePath string, date time.Time) error {
 	return nil
 }
 
-// checkReportExists проверяет, существует ли файл отчета для указанной даты
+// checkReportExists проверяет существование файла отчета
 func checkReportExists(exePath string, date time.Time) bool {
 	reportPath := getReportPath(exePath, date)
 	_, err := os.Stat(reportPath)
@@ -202,239 +338,64 @@ func addRecordToReport(exePath string, date time.Time, cardID, fullName string) 
 	return nil
 }
 
-// showStatus отображает сообщение о статусе операции
-func (a *CheckApp) showStatus(message string, isError bool) {
-	a.statusLabel.SetText(message)
-	if isError {
-		a.statusLabel.TextStyle = fyne.TextStyle{Bold: true}
-	}
-	a.statusLabel.Refresh()
-}
-
-// clearStatus очищает сообщение о статусе
-func (a *CheckApp) clearStatus() {
-	a.statusLabel.SetText("")
-}
-
-// resetUI сбрасывает интерфейс в исходное состояние
-func (a *CheckApp) resetUI() {
-	a.cardEntry.SetText("")
-	a.cardReader.Clear()
-	a.clearStatus()
-	a.infoLabel.SetText("")
-	a.window.Canvas().Focus(a.cardEntry)
-}
-
-// isValidCardID проверяет, что строка содержит ровно 10 цифр
-func isValidCardID(s string) bool {
-	if len(s) != 10 {
-		return false
-	}
-	for _, r := range s {
-		if !unicode.IsDigit(r) {
-			return false
-		}
-	}
-	return true
-}
-
-// processCard обрабатывает карту сотрудника
-func (a *CheckApp) processCard(cardID string) {
-	if !isValidCardID(cardID) {
-		a.showStatus("❌ Неверный формат карты (должно быть 10 цифр)", true)
-		a.cardReader.Clear()
-		return
-	}
-
-	// Поиск сотрудника по карте
-	user, err := a.database.GetUserByCardID(cardID)
+// onReady вызывается когда трей готов
+func onReady(dbPath string) {
+	var err error
+	database, err = db.InitDB(dbPath)
 	if err != nil {
-		a.showStatus(fmt.Sprintf("❌ Ошибка поиска: %v", err), true)
+		showNotification("Ошибка СКУД", fmt.Sprintf("Ошибка БД: %v", err))
+		systray.Quit()
 		return
 	}
 
-	if user == nil {
-		a.showStatus("❌ Сотрудник с такой картой не найден!\nОбратитесь к администратору", true)
-		a.cardReader.Clear()
-		return
-	}
-
-	// Получаем текущую дату
-	currentDate := time.Now()
-
-	// Добавляем запись в отчет
-	err = addRecordToReport(getExePath(), currentDate, user.CardID, user.FullName)
+	// Устанавливаем хук клавиатуры
+	err = setHook()
 	if err != nil {
-		a.showStatus(fmt.Sprintf("❌ Ошибка записи в отчет: %v", err), true)
+		showNotification("Ошибка СКУД", fmt.Sprintf("Не удалось перехватить клавиатуру: %v", err))
+		systray.Quit()
 		return
 	}
 
-	// Успешная отметка
-	currentTime := time.Now().Format("15:04:05")
-	currentDateStr := currentDate.Format("02.01.2006")
+	systray.SetTitle("СКУД")
+	systray.SetTooltip("СКУД - Считыватель карт активен")
 
-	a.showStatus("✅ Отметка успешна!", false)
-	a.infoLabel.SetText(fmt.Sprintf("Сотрудник: %s\nВремя: %s\nДата: %s",
-		user.FullName, currentTime, currentDateStr))
+	// Создаем меню
+	mStatus := systray.AddMenuItem("🟢 СКУД активен", "Приложение работает в фоне")
+	mStatus.Disable()
+	systray.AddSeparator()
+	mTest := systray.AddMenuItem("🧪 Тест уведомления", "Проверить уведомления")
+	systray.AddSeparator()
+	mQuit := systray.AddMenuItem("❌ Выход", "Закрыть приложение")
 
-	a.cardReader.Clear()
-
-	// Автоматический сброс через 3 секунды
+	// Обработчики меню
 	go func() {
-		time.Sleep(3 * time.Second)
-		a.window.Canvas().Focus(nil)
-		a.window.Canvas().Focus(a.cardEntry)
-		a.resetUI()
+		for {
+			select {
+			case <-mTest.ClickedCh:
+				showNotification("Тест СКУД", "Уведомления работают корректно\nПриложение готово к приёму карт")
+			case <-mQuit.ClickedCh:
+				unhook()
+				database.Close()
+				systray.Quit()
+			}
+		}
 	}()
 }
 
-// setupInputHandler настраивает обработчик ввода для считывателя карт
-func (a *CheckApp) setupInputHandler() {
-	prevText := ""
-
-	// Используем OnChanged для отслеживания изменений в поле ввода
-	a.cardEntry.OnChanged = func(text string) {
-		// Если текст стал короче - это backspace, игнорируем
-		if len(text) < len(prevText) {
-			a.cardReader.Clear()
-			prevText = text
-			return
-		}
-
-		// Если добавился один символ
-		if len(text) == len(prevText)+1 {
-			// Регистрируем нажатие клавиши
-			if a.cardReader.AddKey() {
-				// 10 символов введены быстро - обрабатываем карту
-				if isValidCardID(text) {
-					a.processCard(text)
-				} else {
-					// Нецифровые символы - очищаем
-					a.cardEntry.SetText("")
-					a.cardReader.Clear()
-				}
-				prevText = ""
-				return
-			}
-		}
-
-		// Если текст изменился значительно - проверяем на валидность
-		if len(text) >= 10 {
-			if isValidCardID(text) {
-				a.processCard(text)
-				prevText = ""
-				return
-			} else {
-				// Есть нецифровые символы - очищаем
-				a.cardEntry.SetText("")
-				a.cardReader.Clear()
-				prevText = ""
-				return
-			}
-		}
-
-		prevText = text
+// onExit вызывается при выходе
+func onExit() {
+	unhook()
+	if database != nil {
+		database.Close()
 	}
-}
-
-// createUI создает пользовательский интерфейс
-func (a *CheckApp) createUI() {
-	a.cardEntry = widget.NewEntry()
-	a.cardEntry.SetPlaceHolder("Приложите карту к считывателю...")
-
-	a.statusLabel = widget.NewLabel("")
-	a.statusLabel.TextStyle = fyne.TextStyle{Bold: true}
-
-	a.infoLabel = widget.NewLabel("")
-	a.infoLabel.TextStyle = fyne.TextStyle{Bold: true}
-
-	// Иконка карты
-	cardIcon := widget.NewIcon(theme.AccountIcon())
-
-	// Инструкция
-	instruction := widget.NewLabel("Приложите карту к считывателю")
-	instruction.TextStyle = fyne.TextStyle{Bold: true}
-	instruction.Alignment = fyne.TextAlignCenter
-
-	// Статус работы считывателя
-	readerStatus := widget.NewLabel("🟢 Считыватель активен (10 цифр)")
-	readerStatus.TextStyle = fyne.TextStyle{Italic: true}
-
-	// Поле ввода карты
-	cardForm := widget.NewForm(
-		widget.NewFormItem("ID карты", a.cardEntry),
-	)
-
-	// Кнопка ручной обработки
-	manualBtn := widget.NewButtonWithIcon("Обработать", theme.ConfirmIcon(), func() {
-		cardID := strings.TrimSpace(a.cardEntry.Text)
-		a.processCard(cardID)
-	})
-	manualBtn.Importance = widget.HighImportance
-
-	// Кнопка выхода
-	exitBtn := widget.NewButtonWithIcon("Выход", theme.CancelIcon(), func() {
-		a.app.Quit()
-	})
-
-	content := container.NewVBox(
-		layout.NewSpacer(),
-		cardIcon,
-		instruction,
-		readerStatus,
-		widget.NewSeparator(),
-		container.NewPadded(cardForm),
-		container.NewHBox(layout.NewSpacer(), manualBtn, layout.NewSpacer()),
-		a.statusLabel,
-		a.infoLabel,
-		layout.NewSpacer(),
-		container.NewHBox(exitBtn),
-	)
-
-	a.window.SetContent(container.NewPadded(content))
-}
-
-// run запускает приложение
-func (a *CheckApp) run() {
-	a.createUI()
-	a.setupInputHandler()
-	a.window.ShowAndRun()
-}
-
-// newCheckApp создает новое приложение для отметки сотрудников
-func newCheckApp(database *db.DB) *CheckApp {
-	appInstance := app.New()
-	window := appInstance.NewWindow("СКУД - Отметка сотрудников")
-	window.Resize(fyne.NewSize(500, 450))
-
-	checkApp := &CheckApp{
-		app:        appInstance,
-		window:     window,
-		database:   database,
-		cardReader: NewCardReader(),
-	}
-
-	// Обработка закрытия окна
-	window.SetOnClosed(func() {
-		checkApp.app.Quit()
-	})
-
-	return checkApp
 }
 
 func main() {
-	// Настройка консоли для корректного отображения UTF-8 на Windows
-	cmd := exec.Command("chcp", "65001")
-	cmd.Run()
+	// Инициализация БД
+	dbPath := getExePath()
 
-	// Инициализация базы данных
-	database, err := db.InitDB(getExePath())
-	if err != nil {
-		dialog.ShowError(fmt.Errorf("ошибка инициализации базы данных: %v", err), nil)
-		return
-	}
-	defer database.Close()
-
-	checkApp := newCheckApp(database)
-	checkApp.run()
+	// Запускаем systray
+	systray.Run(func() {
+		onReady(dbPath)
+	}, onExit)
 }
