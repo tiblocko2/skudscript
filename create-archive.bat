@@ -19,10 +19,11 @@ set ARCHIVE_DIR=skudscript_release
 if exist "%ARCHIVE_DIR%" rmdir /s /q "%ARCHIVE_DIR%"
 mkdir "%ARCHIVE_DIR%"
 
-REM Копируем exe файлы
+REM Копируем exe файлы и базу данных
 echo [INFO] Копирование файлов...
 copy dist\admin-app.exe "%ARCHIVE_DIR%\" >nul
 copy dist\check-app.exe "%ARCHIVE_DIR%\" >nul
+copy skudscript.db "%ARCHIVE_DIR%\" >nul 2>&1
 copy README.txt "%ARCHIVE_DIR%\" >nul
 
 echo [OK] Файлы скопированы
@@ -42,6 +43,9 @@ if %ERRORLEVEL% equ 0 (
     echo   - admin-app.exe  (админ-панель с GUI)
     echo   - check-app.exe  (отметка сотрудников с GUI)
     echo   - README.txt     (инструкция)
+    echo   - skudscript.db  (база данных)
+    echo.
+    echo GitHub релизы: https://github.com/your-org/skudscript/releases
 ) else (
     echo [ПРЕДУПРЕЖДЕНИЕ] Не удалось создать ZIP архив
     echo   Файлы скопированы в папку: %ARCHIVE_DIR%

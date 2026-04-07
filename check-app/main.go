@@ -20,6 +20,9 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// Version устанавливается через ldflags при сборке
+var version = "dev"
+
 // === Windows API константы ===
 
 const (
@@ -42,6 +45,9 @@ var (
 	procCallNextHookEx      = user32.NewProc("CallNextHookEx")
 	procGetModuleHandle     = kernel32.NewProc("GetModuleHandleW")
 	procMessageBox          = user32.NewProc("MessageBoxW")
+	procGetMessage          = user32.NewProc("GetMessageW")
+	procTranslateMessage    = user32.NewProc("TranslateMessage")
+	procDispatchMessage     = user32.NewProc("DispatchMessageW")
 )
 
 // KBDLLHOOKSTRUCT структура для перехвата клавиш
@@ -54,6 +60,16 @@ type KBDLLHOOKSTRUCT struct {
 }
 
 type HHOOK windows.Handle
+
+// MSG структура для цикла сообщений
+type MSG struct {
+	Hwnd    windows.Handle
+	Message uint32
+	WParam  uintptr
+	LParam  uintptr
+	Time    uint32
+	Pt      struct{ X, Y int32 }
+}
 
 // === Глобальные переменные ===
 
@@ -162,11 +178,12 @@ func keyboardHook(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		now := time.Now()
 		bufferMu.Lock()
 
+		// ЗАКОММЕНТИРОВАНО для тестирования без считывателя:
 		// Если прошло больше 100 мс с последнего символа - сбрасываем буфер
-		if !lastKeyTime.IsZero() && now.Sub(lastKeyTime) > 100*time.Millisecond {
-			cardBuffer.Reset()
-			keyTimes = keyTimes[:0]
-		}
+		// if !lastKeyTime.IsZero() && now.Sub(lastKeyTime) > 100*time.Millisecond {
+		// 	cardBuffer.Reset()
+		// 	keyTimes = keyTimes[:0]
+		// }
 
 		lastKeyTime = now
 
@@ -196,22 +213,60 @@ func callNextHook(nCode int, wParam, lParam uintptr) uintptr {
 	return ret
 }
 
+// messageLoop цикл обработки сообщений Windows для работы глобального хука
+func messageLoop() {
+	var msg MSG
+	for {
+		ret, _, _ := procGetMessage.Call(
+			uintptr(unsafe.Pointer(&msg)),
+			0,
+			0,
+			0,
+		)
+		if ret == 0 {
+			break
+		}
+		procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
+		procDispatchMessage.Call(uintptr(unsafe.Pointer(&msg)))
+	}
+}
+
+// hookReady канал для сигнализации о готовности хука
+var hookReady = make(chan struct{})
+
 // setHook устанавливает глобальный хук клавиатуры
 func setHook() error {
-	hModule, _, _ := procGetModuleHandle.Call(0)
+	// Запускаем хук в отдельной goroutine с собственным циклом сообщений
+	go func() {
+		hModule, _, _ := procGetModuleHandle.Call(0)
 
-	h, _, err := procSetWindowsHookEx.Call(
-		WH_KEYBOARD_LL,
-		syscall.NewCallback(keyboardHook),
-		hModule,
-		0, // 0 = глобальный хук
-	)
+		h, _, err := procSetWindowsHookEx.Call(
+			WH_KEYBOARD_LL,
+			syscall.NewCallback(keyboardHook),
+			hModule,
+			0, // 0 = глобальный хук
+		)
 
-	if h == 0 {
-		return fmt.Errorf("ошибка установки хука: %v", err)
+		if h == 0 {
+			fmt.Fprintf(os.Stderr, "Ошибка установки хука: %v\n", err)
+			close(hookReady)
+			return
+		}
+
+		hook = HHOOK(h)
+		close(hookReady)
+
+		// Запускаем цикл обработки сообщений — это блокирует goroutine
+		messageLoop()
+	}()
+
+	// Ждем инициализации хука
+	<-hookReady
+
+	if hook == 0 {
+		return fmt.Errorf("не удалось установить глобальный хук клавиатуры")
 	}
 
-	hook = HHOOK(h)
 	return nil
 }
 

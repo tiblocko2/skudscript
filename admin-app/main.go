@@ -19,6 +19,9 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+// Version устанавливается через ldflags при сборке
+var version = "dev"
+
 // AdminApp представляет приложение админ-панели
 type AdminApp struct {
 	app      fyne.App
